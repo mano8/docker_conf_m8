@@ -283,7 +283,7 @@ ip addr show docker0
 
 *Example Output*:
 
-```
+```text
 4: docker0: <BROADCAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc noqueue state UNKNOWN group default qlen 1000
     link/ether 02:c2:d9:2d:c2:5f brd ff:ff:ff:ff:ff:ff
     inet 10.254.254.1/24 scope global docker0
