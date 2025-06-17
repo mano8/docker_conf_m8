@@ -219,78 +219,155 @@ sudo "${BASE_DIR}/scripts/manage_docker_certs.sh" generate
 The client certificates directory will be chowned to the `dockremap` UID to ensure proper permissions when mounted into remapped containers.
 
 ---
+---
 
-## 3. Configure Dummy Interface
+## 3. Configure the Dummy Interface
 
-We'll create a dedicated dummy network interface, `docker0`, to host the Docker API endpoint securely.
+To properly configure the `docker0` dummy interface, you need to identify which network management system your Linux distribution uses. This typically depends on whether you're running a server or a desktop environment, and the specific distribution (e.g., Debian, Ubuntu).
 
-### 3.1. Create `docker0` Interface
+**Crucial Note:** You must select **only one** of the following methods to set up the `docker0` interface. Applying multiple configurations for the same interface will lead to conflicts and unpredictable network behavior.
 
-Create a `systemd-networkd` configuration file for the dummy interface.
+Here are the common scenarios to help you determine the correct approach:
+
+* **Netplan:** This is the default on **Ubuntu servers** and most **recent Ubuntu Desktop installations**. Netplan acts as an abstraction layer, generating configurations for either `systemd-networkd` (its default backend) or `NetworkManager`.
+  * *Quick Check:* Look for a YAML file within `/etc/netplan/` (e.g., `00-installer-config.yaml`).
+* **NetworkManager:** Commonly used on most **desktop environments (Ubuntu Desktop, Linux Mint, Debian Desktop)**. It provides dynamic network management, often with a graphical user interface.
+  * *Quick Check:* Execute `systemctl is-active NetworkManager` (it should show `active`) and `nmcli general status`.
+* **`ifupdown`:** This is the traditional method, primarily found on **Debian Server installations** and some older Ubuntu versions, where network settings are configured directly in `/etc/network/interfaces`.
+  * *Quick Check:* Inspect the contents of `/etc/network/interfaces` for specific interface definitions.
+
+Once you've identified your system's network manager, proceed with the steps in the corresponding section below.
+
+### 3.1. Configure Dummy Interface using Netplan (for Systems with Netplan)
+
+If your system relies on **Netplan**, follow these instructions. **If you've previously created direct `systemd-networkd` configuration files (e.g., in `/etc/systemd/network/`) for `docker0`, remove them before proceeding to avoid conflicts.**
+
+#### 3.1.1. Create the Netplan Definition for `docker0`
+
+Create a new Netplan YAML configuration file.
 
 ```bash
-sudo nano /etc/systemd/network/50-docker0-dummy.netdev
+sudo nano /etc/netplan/99-docker-dummy-interface.yaml
 ```
 
-Paste the following content:
+Insert the following configuration. Adjust `10.254.254.1/24` if your chosen `DOCKER_HOST_IP` differs.
+
+```yaml
+network:
+  version: 2
+  renderer: networkd # For server setups, 'networkd' is generally preferred. On desktops where NetworkManager manages all interfaces, 'NetworkManager' might be more appropriate.
+  netdevs:
+    docker0:
+      kind: dummy
+  ethernets:
+    docker0:
+      addresses: [10.254.254.1/24]
+      nameservers:
+        addresses: [1.1.1.1, 8.8.8.8] # Optional: specify DNS servers
+```
+
+*Explanation*: This configuration designates `docker0` as a virtual dummy network device. It then assigns a static IP address (`10.254.254.1/24`) to this interface. Make sure this IP aligns with the `DOCKER_HOST_IP` used during certificate generation.
+
+#### 3.1.2. Apply Netplan Configuration Changes
+
+First, validate the syntax of your new Netplan configuration.
+
+```bash
+sudo netplan try
+```
+
+If `netplan try` reports no errors, permanently apply the configuration.
+
+```bash
+sudo netplan apply
+```
+
+*Explanation*: `netplan try` performs a syntax check and attempts a temporary application. If successful, `netplan apply` writes the necessary backend configurations and restarts the relevant network services to make the changes permanent.
+
+### 3.2. Configure Dummy Interface using NetworkManager (for Systems with NetworkManager)
+
+If **NetworkManager** is your system's primary network management tool (common on Linux Mint, Ubuntu Desktop, Debian Desktop), use these steps.
+
+#### 3.2.1. Establish the `docker0` Dummy Interface and NetworkManager Connection
+
+Utilize `nmcli` to create a new "dummy" type connection named `docker0` and assign its IP address.
+
+```bash
+# Create the dummy interface connection
+sudo nmcli connection add type dummy con-name docker0 ifname docker0
+
+# Assign the static IP address to the docker0 connection
+sudo nmcli connection modify docker0 ipv4.addresses 10.254.254.1/24 ipv4.method manual
+
+# Optional: Set DNS servers for this interface
+sudo nmcli connection modify docker0 ipv4.dns "1.1.1.1 8.8.8.8"
+
+# Activate the connection
+sudo nmcli connection up docker0
+```
+
+*Explanation*: These commands instruct NetworkManager to create a new dummy interface, configure it with the specified static IPv4 address (`10.254.254.1/24`), and then bring the interface online. NetworkManager will automatically persist this configuration.
+
+### 3.3. Configure Dummy Interface using `ifupdown` (for Systems using `/etc/network/interfaces`)
+
+For systems managing network configurations via **`ifupdown`** (typical for traditional Debian server setups not using Netplan or NetworkManager as primary managers), follow these steps.
+
+#### 3.3.1. Manually Create the Dummy Interface
+
+Since `ifupdown` cannot directly create "dummy" type interfaces through its configuration file alone, you'll first create it manually, then ensure its persistence.
+
+```bash
+# Create the docker0 dummy interface (temporary until configured for persistence)
+sudo ip link add docker0 type dummy
+sudo ip link set docker0 up
+```
+
+*Explanation*: These commands create and activate a new virtual network interface of type "dummy" named `docker0`.
+
+#### 3.3.2. Ensure Interface Persistence via `/etc/network/interfaces`
+
+Edit your system's main network configuration file to ensure `docker0` is created and configured at boot time.
+
+```bash
+sudo nano /etc/network/interfaces
+```
+
+Append the following lines to the file. Confirm that the IP `10.254.254.1` matches your `DOCKER_HOST_IP`.
 
 ```ini
-[NetDev]
-Name=docker0
-Kind=dummy
+# Configuration for the Docker API dummy interface
+auto docker0
+iface docker0 inet static
+  pre-up ip link add docker0 type dummy || true
+  address 10.254.254.1
+  netmask 255.255.255.0
+  post-down ip link del docker0 || true
 ```
 
-*Explanation*: This file defines a network device named `docker0` of type `dummy`. Dummy interfaces are virtual interfaces that don't correspond to physical hardware, making them ideal for isolated local communication.
+*Explanation*: These entries ensure the `docker0` interface is automatically brought up (`auto docker0`) with a static IP configuration (`iface docker0 inet static`). The `pre-up` and `post-down` commands handle the creation and deletion of the dummy device itself during interface activation/deactivation.
 
-### 3.2. Configure `docker0` IP Address
+#### 3.3.3. Apply the Network Configuration
 
-Create a `systemd-networkd` configuration file for the IP address of the dummy interface. This IP must match the `DOCKER_HOST_IP` you set when generating certificates.
+To apply these changes without a full system reboot (often required for `ifupdown` changes), try bringing the interface down and then up.
 
 ```bash
-sudo nano /etc/systemd/network/51-docker0-dummy.network
+sudo ifdown docker0
+sudo ifup docker0
 ```
 
-Paste the following content:
+*Note*: Depending on your specific system and its network setup, a complete restart of the networking service (`sudo systemctl restart networking`) or a server reboot might still be necessary for the changes to fully take effect.
 
-```ini
-[Match]
-Name=docker0
+*Important*: If you're using `ifupdown`, verify that `NetworkManager` is not actively managing `docker0` and that Netplan does not have a conflicting configuration for it, to prevent network issues.
 
-[Network]
-Address=10.254.254.1/24
-```
+### 3.4. Verify `docker0` Interface Status (Applicable to All Methods)
 
-*Explanation*: This file configures the `docker0` interface, assigning it the static IP address `10.254.254.1` with a /24 subnet mask. **Ensure this IP address matches the `DOCKER_HOST_IP` you defined earlier.**
-
-### 3.3. Apply Network Configuration
-
-Enable and restart `systemd-networkd` to bring up the dummy interface.
-
-```bash
-sudo systemctl enable systemd-networkd
-sudo systemctl restart systemd-networkd
-```
-
-*Explanation*: These commands ensure `systemd-networkd` starts automatically on boot and then restarts it to apply the new network configurations.
-
-### 3.4. Verify `docker0` Status
-
-Check if the `docker0` interface is up and has the correct IP.
+Regardless of the method you used to set up the dummy interface, confirm that `docker0` is active and has the correct IP address.
 
 ```bash
 ip addr show docker0
 ```
 
-*Example Output*:
-
-```text
-4: docker0: <BROADCAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc noqueue state UNKNOWN group default qlen 1000
-    link/ether 02:c2:d9:2d:c2:5f brd ff:ff:ff:ff:ff:ff
-    inet 10.254.254.1/24 scope global docker0
-       valid_lft forever preferred_lft forever
-```
-
-*Explanation*: This command displays the details of the `docker0` interface, confirming its status and assigned IP address.
+*Expected Output*: Similar to the example provided in the original section, showing `docker0` with an `inet 10.254.254.1/24` entry.
 
 ---
 
